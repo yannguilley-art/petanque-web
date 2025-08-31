@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
-<title>Pétanque — Texture photo + traces</title>
+<title>Pétanque — Tir au fer + Effet (courbe)</title>
 <style>
   :root{ --bg:#0f1216; --ink:#e9eef8; --muted:#aab3c5;
          --blue:#2d7ef7; --red:#ff4d4f; --jack:#ffcf4a; }
@@ -21,6 +21,12 @@
   button{ flex:1 1 auto; min-width:42%; padding:12px 14px; border-radius:12px; border:1px solid #2c3550;
           background:linear-gradient(180deg,#233048,#1a2436); color:var(--ink); font-weight:700; }
   button.secondary{ background:linear-gradient(180deg,#2a2e35,#1b1e24); border-color:#39404c; }
+
+  .modes{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .modebtn{ padding:10px 12px; border-radius:12px; border:1px solid #39404c; background:#1c2230; font-weight:700; }
+  .modebtn.active{ outline:2px solid #5aa2ff; }
+  .chip{ display:flex; gap:8px; align-items:center; padding:8px 10px; border-radius:12px; border:1px solid #39404c; background:#171d28; }
+
   .canvas-wrap{ position:relative; border-radius:18px; padding:10px; border:1px solid #2a2f3a;
                 background: radial-gradient(100% 140% at 50% 0%, #2f4b2d 0%, #20341f 60%, #1a2a19 100%); }
   canvas{ width:100%; height:min(70svh,640px); display:block; border-radius:14px; touch-action:none; }
@@ -30,13 +36,29 @@
           border:1px solid #2a3341; background:linear-gradient(180deg,#18202b,#0f141b); text-align:center; }
   .modal h2{ margin:.2em 0 .5em; }
   .help{ font-size:13px; color:var(--muted); }
+
+  .effet{ display:flex; gap:10px; align-items:center; }
+  .effet input[type="range"]{ width:180px; }
+  .label-small{ font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Pétanque — Mobile</h1>
-    <div class="help">Glisse depuis le cercle pour tirer. Boule sur le bois = morte. Bouchon sur le bois = mène annulée.</div>
+    <div class="modes">
+      <button id="modePointe" class="modebtn active">Pointe</button>
+      <button id="modeTir" class="modebtn">Tir</button>
+      <label class="chip" id="chipFer">
+        <input type="checkbox" id="tirFer" />
+        <span>Tir au fer</span>
+      </label>
+      <label class="chip effet">
+        <span>Effet</span>
+        <input id="spinRange" type="range" min="-1" max="1" step="0.05" value="0" />
+        <span class="label-small">gauche ↔ droite</span>
+      </label>
+    </div>
   </header>
 
   <div class="hud">
@@ -70,7 +92,7 @@
 
 <script>
 (()=> {
-  // ========= UI =========
+  // ====== UI ======
   const C = { blue:'#2d7ef7', red:'#ff4d4f', jack:'#ffcf4a', rim:'#0a0d12' };
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
@@ -88,12 +110,19 @@
     btnNewEnd: document.getElementById('btnNewEnd'),
     btnReset: document.getElementById('btnReset'),
     btnHelp: document.getElementById('btnHelp'),
+    modePointe: document.getElementById('modePointe'),
+    modeTir: document.getElementById('modeTir'),
+    tirFer: document.getElementById('tirFer'),
+    spinRange: document.getElementById('spinRange'),
+    chipFer: document.getElementById('chipFer'),
   };
 
-  // ========= State =========
+  // ====== State ======
   const S = {
     dpr:1,w:0,h:0, margin:28, rail:16,
-    friction:180, e:0.75, maxSpeed:1050,
+    frictionPointe:180, frictionTir:240, frictionFer:420,
+    ePointe:0.75, eTir:0.86, eFer:0.92,
+    maxSpeed:1050,
     throwCircleR:24, throwSpot:{x:0,y:0},
     phase:'place_jack',
     balls:[], jack:null,
@@ -102,40 +131,52 @@
     score:[0,0], end:1,
     aiming:{active:false,power:0,maxDrag:180},
     motionLock:false,
-    lastSnapshot:null
+    lastSnapshot:null,
+    mode:'pointe',
+    tirTarget:null,
+    spin:0,        // -1..1 (gauche..droite)
   };
+
   class Ball{
     constructor(x,y,r,c,m=1,kind='boule',team=-1){
       this.x=x; this.y=y; this.vx=0; this.vy=0; this.r=r; this.color=c; this.mass=m; this.kind=kind; this.team=team; this.dead=false;
-      this.trail=[]; // positions pour la trace
-      this.justSpawned=true;
+      this.trail=[];
+      this.air=false;                // en vol ?
+      this.airPath=null;             // {sx,sy,ex,ey,px,py,amp,t}
+      this.afterLandMode=null;       // 'tir' | 'fer'
+      this.bounce=0;                 // fenêtre “premier contact”
     }
     get speed(){ return Math.hypot(this.vx,this.vy); }
   }
+
   const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
   const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
 
-  // ========= Layout =========
+  // ====== Layout ======
   function resize(){
     const dpr=Math.max(1,Math.min(3,window.devicePixelRatio||1));
     const cssW=canvas.clientWidth, cssH=canvas.clientHeight;
     canvas.width=Math.round(cssW*dpr); canvas.height=Math.round(cssH*dpr);
     S.dpr=dpr; S.w=canvas.width; S.h=canvas.height;
-    placeThrowSpot(); buildTextures(); // rebuild with size
+    placeThrowSpot(); buildTextures();
   }
-  window.addEventListener('resize', resize);
-  window.addEventListener('orientationchange', ()=>setTimeout(resize,250));
+  window.addEventListener('resize', resize, {passive:true});
+  window.addEventListener('orientationchange', ()=>setTimeout(resize,250), {passive:true});
   function playBounds(){ const m=S.margin*S.dpr, r=S.rail*S.dpr; return {x:m+r,y:m+r,w:S.w-2*(m+r),h:S.h-2*(m+r)}; }
   function placeThrowSpot(){ const b=playBounds(); S.throwSpot.x=b.x+b.w*.5; S.throwSpot.y=b.y+b.h*.88; }
 
-  // ========= Snapshots/UI =========
+  // ====== UI helpers ======
   function uiSync(){ ui.endNum.textContent=S.end; ui.scoreBlue.textContent=S.score[0]; ui.scoreRed.textContent=S.score[1]; ui.turnText.textContent=S.currentTeam===0?'Bleu':'Rouge'; ui.ballsLeft.textContent=`${S.left[0]} / ${S.left[1]}`; }
-  function showOverlay(){ ui.overlay.classList.add('show'); }
-  function hideOverlay(){ ui.overlay.classList.remove('show'); }
-  function announceOverlay(t,txt){ ui.overlayTitle.textContent=t; ui.overlayText.textContent=txt; showOverlay(); }
+  const showOverlay=()=>ui.overlay.classList.add('show');
+  const hideOverlay=()=>ui.overlay.classList.remove('show');
+  const announce=(t,txt)=>{ ui.overlayTitle.textContent=t; ui.overlayText.textContent=txt; showOverlay(); };
+
+  ui.modePointe.addEventListener('click', ()=>{ S.mode='pointe'; ui.modePointe.classList.add('active'); ui.modeTir.classList.remove('active'); ui.chipFer.style.opacity=0.6; });
+  ui.modeTir.addEventListener('click', ()=>{ S.mode='tir'; ui.modeTir.classList.add('active'); ui.modePointe.classList.remove('active'); ui.chipFer.style.opacity=1; });
+  ui.spinRange.addEventListener('input', ()=>{ S.spin = parseFloat(ui.spinRange.value)||0; });
 
   function resetMatch(){ S.score=[0,0]; S.end=1; S.startingTeam=Math.random()<0.5?0:1; newEnd({isFirst:true}); }
-  function newEnd({isFirst=false,silent=false}={}){ S.phase='place_jack'; S.balls=[]; S.jack=null; S.left=[S.perTeam,S.perTeam]; S.currentTeam=S.startingTeam; S.motionLock=false; uiSync(); if(!isFirst && !silent) announceOverlay('Nouvelle mène', `À l’équipe ${S.currentTeam===0?'Bleue':'Rouge'} de poser le cochonnet.`); }
+  function newEnd({isFirst=false,silent=false}={}){ S.phase='place_jack'; S.balls=[]; S.jack=null; S.left=[S.perTeam,S.perTeam]; S.currentTeam=S.startingTeam; S.motionLock=false; uiSync(); if(!isFirst && !silent) announce('Nouvelle mène', `À l’équipe ${S.currentTeam===0?'Bleue':'Rouge'} de poser le cochonnet.`); }
   function replayEnd(){ if(S.lastSnapshot){ const a=JSON.parse(S.lastSnapshot); S.phase=a.phase; S.balls=a.balls.map(o=>{const b=new Ball(o.x,o.y,o.r,o.c,o.m,o.k,o.t); b.vx=o.vx; b.vy=o.vy; if(o.k==='jack') S.jack=b; return b;}); S.currentTeam=a.currentTeam; S.startingTeam=a.startingTeam; S.left=a.left; S.score=a.score; S.end=a.end; S.motionLock=false; hideOverlay(); uiSync(); } }
   const snap=()=>JSON.stringify({phase:S.phase,balls:S.balls.map(b=>({x:b.x,y:b.y,vx:b.vx,vy:b.vy,r:b.r,c:b.color,m:b.mass,k:b.kind,t:b.team})),currentTeam:S.currentTeam,startingTeam:S.startingTeam,left:[...S.left],score:[...S.score],end:S.end});
 
@@ -143,56 +184,129 @@
   ui.btnReset.addEventListener('click', ()=>{ resetMatch(); hideOverlay(); });
   ui.overlayNewEnd.addEventListener('click', ()=>{ hideOverlay(); S.end++; newEnd({silent:true}); });
   ui.overlayReplay.addEventListener('click', ()=>{ hideOverlay(); replayEnd(); });
-  ui.btnHelp.addEventListener('click', ()=>announceOverlay('Aide', 'Glisse pour viser. Boule sur le bois = morte. Bouchon sur le bois = mène annulée. 13 points pour gagner.'));
+  ui.btnHelp.addEventListener('click', ()=>announce('Aide', 'Modes : Pointe (roule), Tir (vol + impact). “Tir au fer” réduit le roulage après l’atterrissage. Le slider “Effet” donne une courbe en l’air (gauche/droite). Boule sur le bois = morte. Bouchon sur le bois = mène annulée. 13 points pour gagner.'));
 
-  // ========= Physics =========
-  function resolveCollision(a,b){
+  // ====== Physics ======
+  function resolveCollision(a,b,rest){
     const dx=b.x-a.x, dy=b.y-a.y, d=Math.hypot(dx,dy), min=a.r+b.r;
     if(d===0||d>min) return;
     const nx=dx/(d||1), ny=dy/(d||1), overlap=(min-d)+0.01, tm=a.mass+b.mass;
     a.x-=nx*overlap*(b.mass/tm); a.y-=ny*overlap*(b.mass/tm);
     b.x+=nx*overlap*(a.mass/tm); b.y+=ny*overlap*(a.mass/tm);
     const rvx=b.vx-a.vx, rvy=b.vy-a.vy, vn=rvx*nx+rvy*ny; if(vn>0) return;
-    const j=-(1+S.e)*vn/(1/a.mass+1/b.mass), ix=j*nx, iy=j*ny;
+    const j=-(1+rest)*vn/(1/a.mass+1/b.mass), ix=j*nx, iy=j*ny;
     a.vx-=ix/a.mass; a.vy-=iy/a.mass; b.vx+=ix/b.mass; b.vy+=iy/b.mass;
   }
-  const anyMoving=()=>S.balls.some(b=>b.speed>5);
+  const anyMoving=()=>S.balls.some(b=>b.speed>5 || b.air);
+
+  function blast(x,y,power,rad){
+    for(const b of S.balls){
+      if(b.dead || b.kind!=='boule') continue;
+      const dx=b.x-x, dy=b.y-y, d=Math.hypot(dx,dy);
+      if(d>rad || d===0) continue;
+      const f=(1-d/rad)*power;
+      b.vx += (dx/d)*f; b.vy += (dy/d)*f;
+    }
+  }
 
   function update(dt){
     const bounds=playBounds();
     for(const b of S.balls){
       if(b.dead) continue;
-      const s=b.speed, dec=S.friction*dt;
 
-      // trail sampling (toutes les ~8 px)
+      // --- Trajectoire en l'air (tir/courbe) ---
+      if(b.air && b.airPath){
+        const spd = 900; // px/s progression le long de la courbe
+        const seg = Math.hypot(b.airPath.ex-b.airPath.sx, b.airPath.ey-b.airPath.sy);
+        const inc = (spd*dt)/Math.max(1,seg);
+        b.airPath.t = Math.min(1, b.airPath.t + inc);
+        const t = b.airPath.t;
+        // Quadratic Bezier : P(t) = (1-t)^2*S + 2(1-t)t*(M) + t^2*E
+        // M = milieu + offset perpendiculaire (effet)
+        const Sx=b.airPath.sx, Sy=b.airPath.sy;
+        const Ex=b.airPath.ex, Ey=b.airPath.ey;
+        const Mx=(Sx+Ex)/2 + b.airPath.px*b.airPath.amp;
+        const My=(Sy+Ey)/2 + b.airPath.py*b.airPath.amp;
+        const one=1-t;
+        const x = one*one*Sx + 2*one*t*Mx + t*t*Ex;
+        const y = one*one*Sy + 2*one*t*My + t*t*Ey;
+        b.x=x; b.y=y;
+
+        if(t>=1){
+          b.air=false;
+          // Atterrissage : “tir” ou “fer”
+          const isFer = (b.afterLandMode==='fer');
+          const blastPow = isFer ? 260 : 420;
+          blast(b.x,b.y, blastPow, 42*S.dpr);
+          // vitesse post-atterrissage
+          if(isFer){
+            // très peu de roulage
+            const dir = Math.hypot(Ex-Sx,Ey-Sy)||1;
+            b.vx = ((Ex-Sx)/dir) * (120 + 40*S.aiming.power);
+            b.vy = ((Ey-Sy)/dir) * (120 + 40*S.aiming.power);
+            b.bounce=0.6; // restitution plus sèche
+          }else{
+            const dir = Math.hypot(Ex-Sx,Ey-Sy)||1;
+            b.vx = ((Ex-Sx)/dir) * (260 + 340*S.aiming.power);
+            b.vy = ((Ey-Sy)/dir) * (260 + 340*S.aiming.power);
+            b.bounce=0.5;
+          }
+        }
+        continue; // pas de frottement/collision tant que t<1
+      }
+
+      // frottements selon mode
+      let friction = S.frictionPointe;
+      if(b.bounce>0){ friction = S.frictionTir; }
+      if(b.bounce>0 && b.afterLandMode==='fer'){ friction = S.frictionFer; }
+
+      // trail
+      const s=b.speed;
       if(s>10){
         const last=b.trail[b.trail.length-1];
         if(!last || Math.hypot(b.x-last.x, b.y-last.y) > 8*S.dpr){
-          b.trail.push({x:b.x, y:b.y, r:b.r, life:1});
+          b.trail.push({x:b.x, y:b.y, life:1});
           if(b.trail.length>120) b.trail.shift();
         }
       }
 
-      if(s>0){ if(s<=dec){ b.vx=b.vy=0; } else { const f=1-dec/s; b.vx*=f; b.vy*=f; } }
+      if(s>0){
+        const dec=friction*dt;
+        if(s<=dec){ b.vx=b.vy=0; }
+        else { const f=1-dec/s; b.vx*=f; b.vy*=f; }
+      }
       b.x+=b.vx*dt; b.y+=b.vy*dt;
 
-      // impact crater au premier déplacement
-      if(b.justSpawned && s>40){ b.justSpawned=false; craters.push({x:b.x, y:b.y, r:b.r*1.2, a:0.5}); }
-
+      // bord = bois
       const hit=(b.x-b.r<=bounds.x||b.x+b.r>=bounds.x+b.w||b.y-b.r<=bounds.y||b.y+b.r>=bounds.y+b.h);
-      if(!hit) continue;
-      if(b.kind==='boule'){ b.dead=true; b.vx=b.vy=0; }
-      else { announceOverlay('Mène annulée','Le cochonnet a touché le bord. On rejoue.'); setTimeout(()=>{ hideOverlay(); newEnd({silent:true}); },700); S.motionLock=false; return; }
+      if(hit){
+        if(b.kind==='boule'){ b.dead=true; b.vx=b.vy=0; }
+        else { announce('Mène annulée','Le cochonnet a touché le bord. On rejoue.'); setTimeout(()=>{ hideOverlay(); newEnd({silent:true}); },700); S.motionLock=false; return; }
+      }
+
+      if(b.bounce>0) b.bounce -= dt;
     }
-    // trail fade
+
+    // fade traces
     for(const b of S.balls) for(const p of b.trail) p.life -= dt*0.8;
     for(const b of S.balls) b.trail = b.trail.filter(p=>p.life>0);
 
     if(S.balls.some(b=>b.dead)) S.balls=S.balls.filter(b=>!b.dead);
-    for(let i=0;i<S.balls.length;i++) for(let j=i+1;j<S.balls.length;j++) resolveCollision(S.balls[i],S.balls[j]);
+
+    // collisions
+    for(let i=0;i<S.balls.length;i++){
+      for(let j=i+1;j<S.balls.length;j++){
+        const a=S.balls[i], b=S.balls[j];
+        if(a.air || b.air) continue;
+        const rest = (a.bounce>0 && a.afterLandMode==='fer') || (b.bounce>0 && b.afterLandMode==='fer')
+          ? S.eFer
+          : (a.bounce>0 || b.bounce>0) ? S.eTir : S.ePointe;
+        resolveCollision(a,b,rest);
+      }
+    }
   }
 
-  // ========= Turn & scoring =========
+  // ====== Turns & scoring ======
   function nearest(team){ const jack=S.jack; if(!jack) return Infinity; let best=Infinity; for(const b of S.balls){ if(b.kind==='boule'&&b.team===team){ best=Math.min(best,dist(b,jack)); } } return best; }
   function decideNext(){
     const L=S.left, d0=nearest(0), d1=nearest(1);
@@ -214,38 +328,110 @@
     if(next===null){
       const r=scoreEnd();
       S.score[r.winner]+=r.points;
-      if(S.score[r.winner]>=13){ S.phase='match_over'; announceOverlay('Partie gagnée', `Équipe ${r.winner===0?'Bleue':'Rouge'} atteint 13 — Bleu ${S.score[0]} / Rouge ${S.score[1]}.`); return; }
-      S.startingTeam=r.winner; uiSync(); announceOverlay('Fin de mène', `Équipe ${r.winner===0?'Bleue':'Rouge'} marque ${r.points} point${r.points>1?'s':''}.`);
+      if(S.score[r.winner]>=13){ S.phase='match_over'; announce('Partie gagnée', `Équipe ${r.winner===0?'Bleue':'Rouge'} atteint 13 — Bleu ${S.score[0]} / Rouge ${S.score[1]}.`); return; }
+      S.startingTeam=r.winner; uiSync(); announce('Fin de mène', `Équipe ${r.winner===0?'Bleue':'Rouge'} marque ${r.points} point${r.points>1?'s':''}.`);
       S.phase='scoring'; S.motionLock=false;
     } else { S.currentTeam=next; S.motionLock=false; uiSync(); }
   }
 
-  // ========= Input =========
+  // ====== Input (tactile) ======
   const pointer={x:0,y:0};
   function pt(e){ const r=canvas.getBoundingClientRect(); const t=(e.touches&&e.touches[0])||(e.changedTouches&&e.changedTouches[0])||e; return {x:(t.clientX-r.left)*S.dpr,y:(t.clientY-r.top)*S.dpr}; }
-  function start(e){ e.preventDefault(); if(S.motionLock||anyMoving()) return; const p=pt(e); pointer.x=p.x; pointer.y=p.y; S.aiming.active=true; S.aiming.power=0; }
-  function move(e){ if(!S.aiming.active) return; e.preventDefault(); const p=pt(e); pointer.x=p.x; pointer.y=p.y; const dx=S.throwSpot.x-pointer.x, dy=S.throwSpot.y-pointer.y; const drag=clamp(Math.hypot(dx,dy),0,S.aiming.maxDrag*S.dpr); S.aiming.power=drag/(S.aiming.maxDrag*S.dpr); }
-  function end(e){
-    if(!S.aiming.active) return; e.preventDefault(); if(S.motionLock||anyMoving()){ S.aiming.active=false; return; } S.aiming.active=false;
-    const p=pt(e), dx=S.throwSpot.x-p.x, dy=S.throwSpot.y-p.y, drag=Math.hypot(dx,dy); if(drag<8*S.dpr) return;
-    const dirx=dx/drag, diry=dy/drag, speed=clamp(S.maxSpeed*(drag/(S.aiming.maxDrag*S.dpr)),120,S.maxSpeed);
-    if(S.phase==='place_jack'){ if(!S.jack){ const r=6*S.dpr; const j=new Ball(S.throwSpot.x,S.throwSpot.y,r,C.jack,0.5,'jack'); S.jack=j; S.balls.push(j); } S.jack.vx=dirx*speed; S.jack.vy=diry*speed; S.motionLock=true; }
-    else { if(!S.jack||S.left[S.currentTeam]<=0) return; const r=12*S.dpr, col=S.currentTeam===0?C.blue:C.red; const b=new Ball(S.throwSpot.x,S.throwSpot.y,r,col,1.8,'boule',S.currentTeam); b.vx=dirx*speed; b.vy=diry*speed; S.balls.push(b); S.left[S.currentTeam]--; S.motionLock=true; uiSync(); }
+  function start(e){
+    e.preventDefault(); if(S.motionLock||anyMoving()) return;
+    const p=pt(e); pointer.x=p.x; pointer.y=p.y; S.aiming.active=true; S.aiming.power=0;
+    if(S.mode==='tir' && S.phase==='play'){
+      const tgt = findNearestBoule(p.x,p.y);
+      if(tgt && Math.hypot(p.x-tgt.x,p.y-tgt.y) < tgt.r*2.5) S.tirTarget = {x:tgt.x, y:tgt.y};
+      else S.tirTarget = {x:p.x, y:p.y};
+    }
   }
+  function move(e){
+    if(!S.aiming.active) return; e.preventDefault();
+    const p=pt(e); pointer.x=p.x; pointer.y=p.y;
+    const dx=S.throwSpot.x-pointer.x, dy=S.throwSpot.y-pointer.y;
+    const drag=clamp(Math.hypot(dx,dy),0,S.aiming.maxDrag*S.dpr);
+    S.aiming.power = drag/(S.aiming.maxDrag*S.dpr);
+    if(S.mode==='tir' && S.phase==='play'){
+      const tgt = findNearestBoule(p.x,p.y);
+      if(tgt && Math.hypot(p.x-tgt.x,p.y-tgt.y) < tgt.r*2.5) S.tirTarget = {x:tgt.x, y:tgt.y};
+      else S.tirTarget = {x:p.x, y:p.y};
+    }
+  }
+  function end(e){
+    if(!S.aiming.active) return; e.preventDefault();
+    if(S.motionLock||anyMoving()){ S.aiming.active=false; return; }
+    S.aiming.active=false;
+
+    const p=pt(e);
+    const dx=S.throwSpot.x-p.x, dy=S.throwSpot.y-p.y;
+    const drag=Math.hypot(dx,dy); if(drag<8*S.dpr) return;
+    const dirx=dx/drag, diry=dy/drag;
+    const base = 120, speed=clamp(S.maxSpeed*(drag/(S.aiming.maxDrag*S.dpr)),base,S.maxSpeed);
+
+    if(S.phase==='place_jack'){
+      if(!S.jack){ const r=6*S.dpr; const j=new Ball(S.throwSpot.x,S.throwSpot.y,r,C.jack,0.5,'jack'); S.jack=j; S.balls.push(j); }
+      S.jack.vx=dirx*speed; S.jack.vy=diry*speed; S.motionLock=true;
+    } else {
+      if(!S.jack || S.left[S.currentTeam]<=0) return;
+      const r=12*S.dpr; const col=S.currentTeam===0?C.blue:C.red;
+      const b=new Ball(S.throwSpot.x,S.throwSpot.y,r,col,1.8,'boule',S.currentTeam);
+
+      if(S.mode==='pointe'){
+        b.vx=dirx*speed; b.vy=diry*speed;
+      } else {
+        // ---- Tir avec courbe et option "fer" ----
+        const bnds=playBounds();
+        const tgt = S.tirTarget ? {...S.tirTarget} : {x:p.x,y:p.y};
+        tgt.x = clamp(tgt.x, bnds.x+b.r+2, bnds.x+b.w-b.r-2);
+        tgt.y = clamp(tgt.y, bnds.y+b.r+2, bnds.y+b.h-b.r-2);
+
+        const vdx = (tgt.x - S.throwSpot.x), vdy = (tgt.y - S.throwSpot.y);
+        const vlen = Math.hypot(vdx,vdy) || 1;
+
+        // distance d’atterrissage (portée contrôlée par la jauge)
+        const maxLand = 0.85 * Math.hypot(bnds.w, bnds.h)*0.35;
+        const toTgt = Math.hypot(tgt.x-S.throwSpot.x, tgt.y-S.throwSpot.y);
+        const landD = clamp(toTgt, 30*S.dpr, maxLand) * (0.35 + 0.65*S.aiming.power);
+        const Ex = S.throwSpot.x + vdx/vlen * landD;
+        const Ey = S.throwSpot.y + vdy/vlen * landD;
+
+        // vecteur perpendiculaire pour la courbe (spin)
+        const px = -vdy/vlen, py = vdx/vlen;
+        // amplitude de la courbe (fonction de spin et distance)
+        const amp = (S.spin||0) * Math.min(70*S.dpr, landD*0.25);
+
+        b.air=true;
+        b.airPath = { sx:S.throwSpot.x, sy:S.throwSpot.y, ex:Ex, ey:Ey, px:px, py:py, amp:amp, t:0 };
+        b.afterLandMode = ui.tirFer.checked ? 'fer' : 'tir';
+      }
+
+      S.balls.push(b);
+      S.left[S.currentTeam]--; S.motionLock=true; uiSync();
+    }
+  }
+
+  function findNearestBoule(x,y){
+    let best=null, dmin=1e9;
+    for(const o of S.balls){
+      if(o.kind!=='boule') continue;
+      const d=Math.hypot(o.x-x,o.y-y);
+      if(d<dmin){ dmin=d; best=o; }
+    }
+    return best;
+  }
+
   if('onpointerdown' in window){ canvas.addEventListener('pointerdown',start,{passive:false}); canvas.addEventListener('pointermove',move,{passive:false}); window.addEventListener('pointerup',end,{passive:false}); }
   else { canvas.addEventListener('touchstart',start,{passive:false}); canvas.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',end,{passive:false}); }
 
-  // ========= Textures =========
-  let sandPattern=null, woodTex=null, photoLoaded=false;
-
-  // Procedural fallback (Perlin-ish)
+  // ====== Textures ======
+  let sandPattern=null, woodTex=null;
   function valueNoise(x,y,seed=1337){ const n = Math.sin((x*127.1+y*311.7+seed)*0.0073)*43758.5453; return n - Math.floor(n); }
   function perlin(x,y){ const xi=Math.floor(x), yi=Math.floor(y), xf=x-xi, yf=y-yi;
     function g(u,v){ return valueNoise(xi+u,yi+v); }
     const tl=g(0,0), tr=g(1,0), bl=g(0,1), br=g(1,1), u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf);
     return (tl*(1-u)+tr*u)*(1-v) + (bl*(1-u)+br*u)*v;
   }
-
   function buildSandProcedural(){
     const w=Math.max(512,Math.floor(S.w/1.5)), h=Math.max(512,Math.floor(S.h/1.5));
     const off=document.createElement('canvas'); off.width=w; off.height=h; const o=off.getContext('2d');
@@ -263,16 +449,15 @@
     o.fillStyle=g; o.fillRect(0,0,w,h);
     sandPattern = ctx.createPattern(off,'repeat');
   }
-
   function buildTextures(){
-    // Photo si disponible
-    photoLoaded=false;
+    sandPattern=null;
     const img = new Image();
-    img.src = 'terrain.jpg';
-    img.onload = ()=>{ sandPattern = ctx.createPattern(img,'repeat'); photoLoaded=true; };
+    img.crossOrigin = 'anonymous';
+    img.src = 'terrain.jpg?cache=' + Date.now();
+    img.onload = ()=>{ sandPattern = ctx.createPattern(img,'repeat'); };
     img.onerror = ()=>{ buildSandProcedural(); };
 
-    // rails bois texturés
+    // rails bois
     const wood=document.createElement('canvas'); wood.width=512; wood.height=80; const wctx=wood.getContext('2d');
     const grd=wctx.createLinearGradient(0,0,512,0); grd.addColorStop(0,'#6e5333'); grd.addColorStop(1,'#896640');
     wctx.fillStyle=grd; wctx.fillRect(0,0,512,80);
@@ -284,8 +469,8 @@
     woodTex=wood;
   }
 
-  // ========= Terrain & décor =========
-  const craters=[]; // impacts
+  // ====== Terrain & décor ======
+  const craters=[];
   function drawTerrain(){
     const b=playBounds();
     // rails bois
@@ -327,19 +512,20 @@
     // score incrusté
     drawScore(b);
 
-    // cratères (relief clair + ombre)
+    // cratères (facteur d’estompe intégré aux collisions)
     for(const c of craters){
-      const r=c.r, x=c.x, y=c.y;
+      const r=c.r, x=c.x, y=c.y, a=c.a;
       const g1=ctx.createRadialGradient(x,y,r*0.2,x,y,r*1.4);
-      g1.addColorStop(0,'rgba(0,0,0,.18)');
+      g1.addColorStop(0,'rgba(0,0,0,'+(0.20*a)+')');
       g1.addColorStop(1,'rgba(0,0,0,0)');
       ctx.fillStyle=g1; ctx.beginPath(); ctx.arc(x,y,r*1.4,0,Math.PI*2); ctx.fill();
       const g2=ctx.createRadialGradient(x,y,r*0.2,x,y,r);
-      g2.addColorStop(0,'rgba(255,255,255,.15)');
+      g2.addColorStop(0,'rgba(255,255,255,'+(0.12*a)+')');
       g2.addColorStop(1,'rgba(255,255,255,0)');
       ctx.fillStyle=g2; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
-      c.a*=0.995;
+      c.a *= 0.992;
     }
+    for(let i=craters.length-1;i>=0;i--) if(craters[i].a<0.05) craters.splice(i,1);
   }
 
   function drawScore(b){
@@ -356,25 +542,19 @@
     ctx.restore();
   }
 
-  // ========= Boules & traces =========
+  // ====== Dessin boules/traces/viseur ======
   function drawTrail(b){
     if(b.trail.length<2) return;
     ctx.save();
-    ctx.globalAlpha=0.22;
-    ctx.strokeStyle='rgba(0,0,0,.55)';
-    ctx.lineWidth=Math.max(1, b.r*0.35);
-    ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.globalAlpha=0.22; ctx.strokeStyle='rgba(0,0,0,.55)';
+    ctx.lineWidth=Math.max(1, b.r*0.35); ctx.lineCap='round'; ctx.lineJoin='round';
     ctx.beginPath();
     for(let i=0;i<b.trail.length;i++){
-      const p=b.trail[i];
-      const a=Math.max(0,Math.min(1,p.life));
-      ctx.globalAlpha=0.10 + 0.18*a;
+      const p=b.trail[i]; const a=Math.max(0,Math.min(1,p.life)); ctx.globalAlpha=0.10 + 0.18*a;
       if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
     }
-    ctx.stroke();
-    ctx.restore();
+    ctx.stroke(); ctx.restore();
   }
-
   function drawBall(b){
     // ombre portée
     ctx.save();
@@ -383,8 +563,7 @@
     g.addColorStop(0,'rgba(0,0,0,.35)'); g.addColorStop(1,'rgba(0,0,0,0)');
     ctx.fillStyle=g; ctx.beginPath(); ctx.arc(b.x,b.y+oy,or,0,Math.PI*2); ctx.fill();
     ctx.restore();
-
-    // boules
+    // boule
     ctx.save(); ctx.shadowColor='rgba(0,0,0,.35)'; ctx.shadowBlur=6*S.dpr; ctx.shadowOffsetY=2*S.dpr;
     ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fillStyle=b.color; ctx.fill(); ctx.restore();
     ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.lineWidth=2*S.dpr; ctx.strokeStyle=C.rim; ctx.stroke();
@@ -392,7 +571,6 @@
     h.addColorStop(0,'rgba(255,255,255,.55)'); h.addColorStop(1,'rgba(255,255,255,0)');
     ctx.fillStyle=h; ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fill();
   }
-
   function drawThrowCircle(){
     const c=S.throwSpot, R=S.throwCircleR*S.dpr;
     ctx.save();
@@ -403,6 +581,7 @@
   function drawAim(){
     const c=S.throwSpot, dx=c.x-pointer.x, dy=c.y-pointer.y;
     const L=clamp(Math.hypot(dx,dy),0,S.aiming.maxDrag*S.dpr), dirx=dx/(L||1), diry=dy/(L||1);
+    // flèche + jauge
     ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='rgba(255,255,255,.85)'; ctx.lineWidth=3*S.dpr;
     ctx.beginPath(); ctx.moveTo(c.x,c.y); ctx.lineTo(c.x-dirx*L, c.y-diry*L); ctx.stroke();
     const ax=c.x-dirx*L, ay=c.y-diry*L, head=10*S.dpr+4*S.aiming.power;
@@ -412,13 +591,34 @@
     ctx.fillStyle= S.phase==='place_jack' ? C.jack : (S.currentTeam===0?C.blue:C.red);
     ctx.fillRect(px,py,bw*S.aiming.power,bh);
     ctx.restore();
+
+    // viseur de tir
+    if(S.mode==='tir' && S.phase==='play' && S.tirTarget){
+      const x=S.tirTarget.x, y=S.tirTarget.y, R=14*S.dpr;
+      ctx.save(); ctx.globalAlpha=0.9;
+      ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2); ctx.strokeStyle='rgba(255,255,255,.9)'; ctx.lineWidth=2*S.dpr; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x-R,y); ctx.lineTo(x+R,y); ctx.moveTo(x,y-R); ctx.lineTo(x,y+R); ctx.stroke();
+      // Indication d’effet (chevron latéral)
+      const side = S.spin || 0;
+      if(Math.abs(side)>0.05){
+        ctx.globalAlpha=0.7;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + Math.sign(side)*R*1.5, y - R*0.6);
+        ctx.lineTo(x + Math.sign(side)*R*1.5, y + R*0.6);
+        ctx.closePath();
+        ctx.fillStyle='rgba(255,255,255,.6)';
+        ctx.fill();
+      }
+      ctx.restore();
+    }
   }
   function drawTurnMarker(){
     const c=S.throwSpot, R=S.throwCircleR*S.dpr, col=S.currentTeam===0?C.blue:C.red;
     ctx.save(); ctx.beginPath(); ctx.arc(c.x, c.y-R-10*S.dpr, 6*S.dpr, 0, Math.PI*2); ctx.fillStyle=col; ctx.fill(); ctx.restore();
   }
 
-  // ========= Loop =========
+  // ====== Loop ======
   let last=performance.now();
   function loop(now){
     const dt=Math.min(0.033,(now-last)/1000); last=now;
@@ -434,7 +634,7 @@
     requestAnimationFrame(loop);
   }
 
-  // ========= Start =========
+  // ====== Start ======
   function boot(){ resize(); uiSync(); resetMatch(); requestAnimationFrame(loop); }
   boot();
 })();
