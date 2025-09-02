@@ -45,6 +45,8 @@
   .help{ font-size:13px; color:var(--muted); }
   #err{ position:fixed; top:0; left:0; right:0; z-index:9999; display:none;
         background:#b00020; color:#fff; padding:10px 12px; font-weight:700; }
+  .soundbtn{ margin-left:auto; background:linear-gradient(180deg,#263243,#1a2331);
+             border:1px solid #344157; padding:10px 12px; border-radius:12px; font-size:16px; }
 </style>
 </head>
 <body>
@@ -54,6 +56,7 @@
   <header>
     <h1>Pétanque — Mobile</h1>
     <div class="badge">Cochonnet jaune • Bleu / Rouge</div>
+    <button id="btnSound" class="soundbtn" aria-pressed="false" title="Activer le son">🔇</button>
   </header>
 
   <div class="hud">
@@ -115,7 +118,87 @@
     btnNewEnd: document.getElementById('btnNewEnd'),
     btnReset: document.getElementById('btnReset'),
     btnHelp: document.getElementById('btnHelp'),
+    btnSound: document.getElementById('btnSound'),
   };
+
+  // --- Audio & vibrations ---
+  const sfx = (()=> {
+    const api = { enabled:false, ctx:null, gain:null };
+    function ensureCtx(){
+      if(api.ctx) return true;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return false;
+      api.ctx = new AC();
+      api.gain = api.ctx.createGain();
+      api.gain.gain.value = 0.6;
+      api.gain.connect(api.ctx.destination);
+      return true;
+    }
+    function env(duration=0.15, type='sine', freq=440, vol=0.6, opts={}){
+      if(!api.enabled || !ensureCtx()) return;
+      const t0 = api.ctx.currentTime + (opts.delay||0);
+      const osc = api.ctx.createOscillator();
+      const g = api.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t0);
+      if(opts.freqTo){ osc.frequency.exponentialRampToValueAtTime(opts.freqTo, t0+duration*0.9); }
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol, t0+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0+duration);
+      osc.connect(g); g.connect(api.gain);
+      osc.start(t0); osc.stop(t0+duration+0.02);
+    }
+    function noise(duration=0.08, vol=0.5, lp=1500){
+      if(!api.enabled || !ensureCtx()) return;
+      const t0 = api.ctx.currentTime;
+      const buffer = api.ctx.createBuffer(1, api.ctx.sampleRate*duration, api.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for(let i=0;i<data.length;i++) data[i] = (Math.random()*2-1)*0.9;
+      const src = api.ctx.createBufferSource(); src.buffer=buffer;
+      const biq = api.ctx.createBiquadFilter(); biq.type='lowpass'; biq.frequency.value=lp;
+      const g = api.ctx.createGain();
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0+duration);
+      src.connect(biq); biq.connect(g); g.connect(api.gain);
+      src.start(t0);
+    }
+    function vibrate(ms){ if(navigator.vibrate) navigator.vibrate(ms); }
+
+    return {
+      toggle(){
+        api.enabled = !api.enabled;
+        if(api.enabled){ ensureCtx(); api.ctx.resume && api.ctx.resume(); }
+        return api.enabled;
+      },
+      arm(){ // appelé sur 1ère interaction pour autoriser iOS
+        if(!api.enabled){ api.enabled=true; ensureCtx(); }
+      },
+      play(name, strength=1){
+        if(!api.enabled) return;
+        switch(name){
+          case 'ui': env(0.06,'triangle',600,0.25); break;
+          case 'throw': noise(0.08,0.35,1800); env(0.09,'sine',380,0.15,{freqTo:300}); break;
+          case 'hit': env(0.05,'square',220+Math.random()*60,0.25); vibrate(8); break;
+          case 'dead': noise(0.09,0.45,900); env(0.08,'sine',130,0.18); vibrate(18); break;
+          case 'jackOut': env(0.3,'sawtooth',500,0.18,{freqTo:160}); noise(0.12,0.3,1200); vibrate(25); break;
+          case 'score': env(0.18,'sine',880,0.22); env(0.18,'sine',1320,0.15,{delay:0.04}); break;
+          case 'win': env(0.22,'triangle',660,0.22); env(0.25,'triangle',990,0.22,{delay:0.12}); env(0.3,'triangle',1320,0.22,{delay:0.24}); break;
+        }
+      }
+    };
+  })();
+
+  ui.btnSound.addEventListener('click', ()=>{
+    const on = sfx.toggle();
+    ui.btnSound.textContent = on ? '🔊' : '🔇';
+    ui.btnSound.setAttribute('aria-pressed', on ? 'true' : 'false');
+    sfx.play('ui');
+  });
+
+  // Activer l’audio au premier geste utilisateur
+  const armAudioOnce = ()=>{ sfx.arm(); window.removeEventListener('pointerdown', armAudioOnce); window.removeEventListener('touchstart', armAudioOnce); };
+  window.addEventListener('pointerdown', armAudioOnce, {passive:true});
+  window.addEventListener('touchstart', armAudioOnce, {passive:true});
 
   // State
   const COLORS = { blue:'#2d7ef7', red:'#ff4d4f', jack:'#ffcf4a', rim:'#0b0d12' };
@@ -139,10 +222,8 @@
 
   // === Texture image "cover" ===
   let terrainImg = null, terrainReady = false;
-  // Mets TRUE si ton image contient déjà des bordures/bois (on n'ajoute pas nos rails)
-  const IMAGE_HAS_RAILS = true;
-
-  // Fallback sable procédural (utilisé si l'image n'est pas chargée)
+  const IMAGE_HAS_RAILS = true; // ton photo-terrain inclut déjà des bordures
+  // Fallback sable procédural
   let sandPattern = null;
   function buildProceduralSand(){
     const w=Math.max(512, Math.floor(state.w/1.5));
@@ -168,15 +249,13 @@
     o.fillStyle=g; o.fillRect(0,0,w,h);
     sandPattern = ctx.createPattern(off,'repeat');
   }
-
   function buildTextures(){
     terrainReady = false;
     terrainImg = new Image();
     terrainImg.onload  = ()=>{ terrainReady = true; };
     terrainImg.onerror = ()=>{ terrainReady = false; buildProceduralSand(); };
-    terrainImg.src = 'terrain.jpg?cache=' + Date.now(); // anti-cache
-    sandPattern = null;
-    buildProceduralSand(); // au cas où
+    terrainImg.src = 'terrain.jpg?cache=' + Date.now();
+    sandPattern = null; buildProceduralSand();
   }
 
   // Utils
@@ -217,7 +296,7 @@
     state.throwSpot.y = b.y + b.h*0.88;
   }
 
-  // Snapshots (pour rejouer la mène)
+  // Snapshots
   function serializeSnapshot(){
     return JSON.stringify({
       phase: state.phase,
@@ -281,11 +360,11 @@
   function replayEnd(){ if(state.lastSnapshot) loadSnapshot(state.lastSnapshot); }
 
   // Buttons
-  ui.btnNewEnd.addEventListener('click', ()=>{ state.endNum++; newEnd(); });
-  ui.btnReset.addEventListener('click', ()=>{ resetMatch(); hideOverlay(); });
-  ui.overlayNewEnd.addEventListener('click', ()=>{ hideOverlay(); state.endNum++; newEnd({silent:true}); });
-  ui.overlayReplay.addEventListener('click', ()=>{ hideOverlay(); replayEnd(); });
-  ui.btnHelp.addEventListener('click', ()=>{ announceOverlay('Aide', '1) Pose le cochonnet depuis le cercle. 2) Joue les boules en glissant. La plus loin rejoue. Boule sur rail = morte. Bouchon sur rail = on rejoue. À 13 = victoire.'); });
+  ui.btnNewEnd.addEventListener('click', ()=>{ sfx.play('ui'); state.endNum++; newEnd(); });
+  ui.btnReset.addEventListener('click', ()=>{ sfx.play('ui'); resetMatch(); hideOverlay(); });
+  ui.overlayNewEnd.addEventListener('click', ()=>{ sfx.play('ui'); hideOverlay(); state.endNum++; newEnd({silent:true}); });
+  ui.overlayReplay.addEventListener('click', ()=>{ sfx.play('ui'); hideOverlay(); replayEnd(); });
+  ui.btnHelp.addEventListener('click', ()=>{ sfx.play('ui'); announceOverlay('Aide', '1) Pose le cochonnet depuis le cercle. 2) Joue les boules en glissant. La plus loin rejoue. Boule sur rail = morte. Bouchon sur rail = on rejoue. À 13 = victoire.'); });
 
   // Effects (toasts)
   function addToast(text,x,y){ state.toasts.push({text,x,y,ttl:1.3}); }
@@ -307,6 +386,7 @@
 
   // Physics
   function resolveCollision(a,b){
+    const preRel = Math.hypot(b.vx-a.vx, b.vy-a.vy); // pour jauger la force
     const dx=b.x-a.x, dy=b.y-a.y, d=Math.hypot(dx,dy), min=a.r+b.r;
     if(d===0||d>min) return;
     const overlap=(min-d)+0.01, nx=dx/(d||1), ny=dy/(d||1), tm=a.mass+b.mass;
@@ -316,6 +396,7 @@
     if(vn<=0){
       const e=state.ballRestitution || 0.75, j=-(1+e)*vn/(1/a.mass+1/b.mass), ix=j*nx, iy=j*ny;
       a.vx-=ix/a.mass; a.vy-=iy/a.mass; b.vx+=ix/b.mass; b.vy+=iy/b.mass;
+      if(preRel>120){ sfx.play('hit'); }
     }
   }
   function anyMoving(){ for(const b of state.balls){ if(b.speed>5) return true; } return false; }
@@ -336,10 +417,12 @@
         if(b.x-b.r<=bounds.x||b.x+b.r>=bounds.x+b.w||b.y-b.r<=bounds.y||b.y+b.r>=bounds.y+b.h){
           b.dead=true;
           addToast('Boule morte', b.x, b.y-18*state.dpr);
+          sfx.play('dead');
           b.vx=0; b.vy=0; continue;
         }
       } else {
         if(b.x-b.r<=bounds.x||b.x+b.r>=bounds.x+b.w||b.y-b.r<=bounds.y||b.y+b.r>=bounds.y+b.h){
+          sfx.play('jackOut');
           announceOverlay('Mène annulée','Le cochonnet a touché le bord. On rejoue en reposant le cochonnet.');
           setTimeout(()=>{ hideOverlay(); newEnd({silent:true}); }, 700);
           state.motionLock=false; return;
@@ -398,6 +481,7 @@
     ui.overlayNewEnd.textContent='Lancer la prochaine mène';
     ui.overlayReplay.textContent='Rejouer cette mène';
     announceOverlay('Fin de mène', `Équipe ${team} marque ${points} point${points>1?'s':''}. Score — Bleu: ${state.score[0]} / Rouge: ${state.score[1]}.`);
+    sfx.play('score');
   }
   function showMatchWin(winner){
     const team = winner===0?'Bleue':'Rouge';
@@ -406,6 +490,7 @@
     ui.overlayNewEnd.textContent='Rejouer la partie';
     ui.overlayReplay.textContent='Revoir la dernière mène';
     announceOverlay('Partie gagnée', `Bravo ! L’équipe ${team} atteint 13. Score final — Bleu: ${state.score[0]} / Rouge: ${state.score[1]}.`);
+    sfx.play('win');
   }
   function afterMotionSettled(){
     if(state.phase==='place_jack'){
@@ -470,6 +555,7 @@
         state.jack=jack; state.balls.push(jack);
       }
       state.jack.vx=dirx*speed; state.jack.vy=diry*speed; state.motionLock=true;
+      sfx.play('throw');
     } else if(state.phase==='play'){
       if(!state.jack){ addToast('Pose d’abord le cochonnet', state.throwSpot.x, state.throwSpot.y-24*state.dpr); return; }
       if(state.left[state.currentTeam]<=0) return;
@@ -477,6 +563,7 @@
       const boule=new Ball(state.throwSpot.x,state.throwSpot.y,r,col,1.8,'boule',state.currentTeam);
       boule.vx=dirx*speed; boule.vy=diry*speed; state.balls.push(boule);
       state.left[state.currentTeam]--; state.motionLock=true;
+      sfx.play('throw');
     }
     updateUI();
   }
@@ -507,11 +594,7 @@
     const b=playBounds();
 
     if (terrainReady && terrainImg){
-      // Si l'image contient déjà des rails, on ne dessine pas nos rails.
-      if (!IMAGE_HAS_RAILS){
-        drawRails(b);
-      }
-      // "cover" : occuper toute l'aire en conservant le ratio
+      if (!IMAGE_HAS_RAILS){ drawRails(b); }
       const iw=terrainImg.naturalWidth, ih=terrainImg.naturalHeight;
       const rImg=iw/ih, rDst=b.w/b.h;
       let dw, dh, dx, dy;
@@ -520,7 +603,6 @@
       dx=b.x+(b.w-dw)/2; dy=b.y+(b.h-dh)/2;
       ctx.drawImage(terrainImg, dx, dy, dw, dh);
 
-      // Légère ombre intérieure
       const ao=22*state.dpr;
       let gL=ctx.createLinearGradient(b.x,b.y,b.x+ao,b.y); gL.addColorStop(0,'rgba(0,0,0,.28)'); gL.addColorStop(1,'rgba(0,0,0,0)');
       ctx.fillStyle=gL; ctx.fillRect(b.x,b.y,ao,b.h);
@@ -533,7 +615,7 @@
       return;
     }
 
-    // Fallback : nos rails + sable procédural
+    // Fallback : rails + sable procédural
     drawRails(b);
     if(!sandPattern){ buildProceduralSand(); }
     ctx.save(); ctx.beginPath(); ctx.rect(b.x,b.y,b.w,b.h); ctx.fillStyle=sandPattern; ctx.fill();
@@ -556,10 +638,10 @@
     const g=ctx.createLinearGradient(b.x-r,b.y,b.x,b.y);
     g.addColorStop(0,'#5f4728'); g.addColorStop(1,'#7a5d37');
     ctx.fillStyle=g;
-    ctx.fillRect(b.x-r, b.y-r, b.w+2*r, r);      // haut
-    ctx.fillRect(b.x-r, b.y+b.h, b.w+2*r, r);    // bas
-    ctx.fillRect(b.x-r, b.y, r, b.h);            // gauche
-    ctx.fillRect(b.x+b.w, b.y, r, b.h);          // droite
+    ctx.fillRect(b.x-r, b.y-r, b.w+2*r, r);
+    ctx.fillRect(b.x-r, b.y+b.h, b.w+2*r, r);
+    ctx.fillRect(b.x-r, b.y, r, b.h);
+    ctx.fillRect(b.x+b.w, b.y, r, b.h);
     ctx.restore();
   }
 
