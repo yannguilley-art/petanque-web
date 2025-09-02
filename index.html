@@ -137,20 +137,23 @@
     overlayMode: null,
   };
 
-  // ===== Textures : terrain.jpg (fallback procédural) =====
-  let sandPattern = null, woodCanvas = null;
+  // === Texture image "cover" ===
+  let terrainImg = null, terrainReady = false;
+  // Mets TRUE si ton image contient déjà des bordures/bois (on n'ajoute pas nos rails)
+  const IMAGE_HAS_RAILS = true;
+
+  // Fallback sable procédural (utilisé si l'image n'est pas chargée)
+  let sandPattern = null;
   function buildProceduralSand(){
     const w=Math.max(512, Math.floor(state.w/1.5));
     const h=Math.max(512, Math.floor(state.h/1.5));
     const off=document.createElement('canvas'); off.width=w; off.height=h; const o=off.getContext('2d');
-
     function vnoise(x,y,seed=1337){ const n = Math.sin((x*127.1+y*311.7+seed)*0.0073)*43758.5453; return n - Math.floor(n); }
     function perlin(x,y){ const xi=Math.floor(x), yi=Math.floor(y), xf=x-xi, yf=y-yi;
       function g(u,v){ return vnoise(xi+u,yi+v); }
       const tl=g(0,0), tr=g(1,0), bl=g(0,1), br=g(1,1), u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf);
       return (tl*(1-u)+tr*u)*(1-v) + (bl*(1-u)+br*u)*v;
     }
-
     const img=o.createImageData(w,h); let k=0;
     for(let j=0;j<h;j++){
       for(let i=0;i<w;i++){
@@ -163,27 +166,17 @@
     const g=o.createRadialGradient(w/2,h*0.55, Math.min(w,h)*0.1, w/2,h*0.55, Math.max(w,h)*0.8);
     g.addColorStop(0,'rgba(255,255,255,.08)'); g.addColorStop(1,'rgba(0,0,0,.20)');
     o.fillStyle=g; o.fillRect(0,0,w,h);
-
     sandPattern = ctx.createPattern(off,'repeat');
   }
-  function buildTextures(){
-    // rails en bois
-    woodCanvas=document.createElement('canvas'); woodCanvas.width=512; woodCanvas.height=80;
-    const wctx=woodCanvas.getContext('2d');
-    const grd=wctx.createLinearGradient(0,0,512,0); grd.addColorStop(0,'#6e5333'); grd.addColorStop(1,'#896640');
-    wctx.fillStyle=grd; wctx.fillRect(0,0,512,80);
-    wctx.globalAlpha=0.18; wctx.fillStyle='rgba(255,255,255,.10)';
-    for(let x=0;x<512;x++){ const y=40 + Math.sin(x*0.08)*6 + (Math.sin(x*0.15)*2); wctx.fillRect(x, y, 1, 80-y); }
-    wctx.globalAlpha=0.28; wctx.fillStyle='rgba(0,0,0,.25)';
-    for(let x=8;x<512;x+=18){ wctx.fillRect(x,0,1,80); }
-    wctx.globalAlpha=1;
 
-    // tente de charger terrain.jpg
+  function buildTextures(){
+    terrainReady = false;
+    terrainImg = new Image();
+    terrainImg.onload  = ()=>{ terrainReady = true; };
+    terrainImg.onerror = ()=>{ terrainReady = false; buildProceduralSand(); };
+    terrainImg.src = 'terrain.jpg?cache=' + Date.now(); // anti-cache
     sandPattern = null;
-    const img = new Image(); img.crossOrigin='anonymous'; img.referrerPolicy='no-referrer';
-    img.onload=()=>{ sandPattern = ctx.createPattern(img,'repeat'); };
-    img.onerror=()=>{ buildProceduralSand(); };
-    img.src='terrain.jpg?cache='+Date.now();
+    buildProceduralSand(); // au cas où
   }
 
   // Utils
@@ -224,7 +217,7 @@
     state.throwSpot.y = b.y + b.h*0.88;
   }
 
-  // Snapshots (optionnel pour rejouer la mène)
+  // Snapshots (pour rejouer la mène)
   function serializeSnapshot(){
     return JSON.stringify({
       phase: state.phase,
@@ -499,45 +492,74 @@
     window.addEventListener('touchcancel', (e)=>{ state.aiming.active=false; }, {passive:true});
   }
 
-  // Drawing
+  // ====== Rendu ======
   function draw(){
     const {w,h}=state;
     ctx.clearRect(0,0,w,h);
     drawTerrain(); drawThrowCircle();
-    drawScoreOverlayOnField(); // score incrusté sur le terrain
+    drawScoreOverlayOnField();
     for(const b of state.balls) drawBall(b);
     if(state.aiming.active) drawAim();
     drawTurnMarker(); drawToasts();
   }
+
   function drawTerrain(){
     const b=playBounds();
-    // rails
+
+    if (terrainReady && terrainImg){
+      // Si l'image contient déjà des rails, on ne dessine pas nos rails.
+      if (!IMAGE_HAS_RAILS){
+        drawRails(b);
+      }
+      // "cover" : occuper toute l'aire en conservant le ratio
+      const iw=terrainImg.naturalWidth, ih=terrainImg.naturalHeight;
+      const rImg=iw/ih, rDst=b.w/b.h;
+      let dw, dh, dx, dy;
+      if (rImg > rDst){ dh=b.h; dw=dh*rImg; }
+      else { dw=b.w; dh=dw/rImg; }
+      dx=b.x+(b.w-dw)/2; dy=b.y+(b.h-dh)/2;
+      ctx.drawImage(terrainImg, dx, dy, dw, dh);
+
+      // Légère ombre intérieure
+      const ao=22*state.dpr;
+      let gL=ctx.createLinearGradient(b.x,b.y,b.x+ao,b.y); gL.addColorStop(0,'rgba(0,0,0,.28)'); gL.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=gL; ctx.fillRect(b.x,b.y,ao,b.h);
+      let gR=ctx.createLinearGradient(b.x+b.w,b.y,b.x+b.w-ao,b.y); gR.addColorStop(0,'rgba(0,0,0,.26)'); gR.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=gR; ctx.fillRect(b.x+b.w-ao,b.y,ao,b.h);
+      let gT=ctx.createLinearGradient(0,b.y,0,b.y+ao); gT.addColorStop(0,'rgba(0,0,0,.30)'); gT.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=gT; ctx.fillRect(b.x,b.y,b.w,ao);
+      let gB=ctx.createLinearGradient(0,b.y+b.h,0,b.y+b.h-ao); gB.addColorStop(0,'rgba(0,0,0,.22)'); gB.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=gB; ctx.fillRect(b.x,b.y+b.h-ao,b.w,ao);
+      return;
+    }
+
+    // Fallback : nos rails + sable procédural
+    drawRails(b);
+    if(!sandPattern){ buildProceduralSand(); }
+    ctx.save(); ctx.beginPath(); ctx.rect(b.x,b.y,b.w,b.h); ctx.fillStyle=sandPattern; ctx.fill();
+
+    const ao=22*state.dpr;
+    let gL2=ctx.createLinearGradient(b.x,b.y,b.x+ao,b.y); gL2.addColorStop(0,'rgba(0,0,0,.32)'); gL2.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gL2; ctx.fillRect(b.x,b.y,ao,b.h);
+    let gR2=ctx.createLinearGradient(b.x+b.w,b.y,b.x+b.w-ao,b.y); gR2.addColorStop(0,'rgba(0,0,0,.30)'); gR2.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gR2; ctx.fillRect(b.x+b.w-ao,b.y,ao,b.h);
+    let gT2=ctx.createLinearGradient(0,b.y,0,b.y+ao); gT2.addColorStop(0,'rgba(0,0,0,.33)'); gT2.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gT2; ctx.fillRect(b.x,b.y,b.w,ao);
+    let gB2=ctx.createLinearGradient(0,b.y+b.h,0,b.y+b.h-ao); gB2.addColorStop(0,'rgba(0,0,0,.28)'); gB2.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gB2; ctx.fillRect(b.x,b.y+b.h-ao,b.w,ao);
+    ctx.restore();
+  }
+
+  function drawRails(b){
+    const r=state.rail*state.dpr;
     ctx.save();
-    const g=ctx.createLinearGradient(b.x-state.rail*state.dpr,b.y,b.x,b.y);
+    const g=ctx.createLinearGradient(b.x-r,b.y,b.x,b.y);
     g.addColorStop(0,'#5f4728'); g.addColorStop(1,'#7a5d37');
     ctx.fillStyle=g;
-    ctx.fillRect(b.x-state.rail*state.dpr, b.y-state.rail*state.dpr, b.w+2*state.rail*state.dpr, state.rail*state.dpr);
-    ctx.fillRect(b.x-state.rail*state.dpr, b.y+b.h, b.w+2*state.rail*state.dpr, state.rail*state.dpr);
-    ctx.fillRect(b.x-state.rail*state.dpr, b.y, state.rail*state.dpr, b.h);
-    ctx.fillRect(b.x+b.w, b.y, state.rail*state.dpr, b.h);
-    ctx.restore();
-
-    // sable : image terrain.jpg si dispo, sinon procédural
-    if(!sandPattern){ buildProceduralSand(); }
-    ctx.save();
-    ctx.beginPath(); ctx.rect(b.x,b.y,b.w,b.h); ctx.fillStyle=sandPattern; ctx.fill();
-
-    // AO bords
-    const ao=22*state.dpr;
-    let gL=ctx.createLinearGradient(b.x,b.y,b.x+ao,b.y); gL.addColorStop(0,'rgba(0,0,0,.32)'); gL.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gL; ctx.fillRect(b.x,b.y,ao,b.h);
-    let gR=ctx.createLinearGradient(b.x+b.w,b.y,b.x+b.w-ao,b.y); gR.addColorStop(0,'rgba(0,0,0,.30)'); gR.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gR; ctx.fillRect(b.x+b.w-ao,b.y,ao,b.h);
-    let gT=ctx.createLinearGradient(0,b.y,0,b.y+ao); gT.addColorStop(0,'rgba(0,0,0,.33)'); gT.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gT; ctx.fillRect(b.x,b.y,b.w,ao);
-    let gB=ctx.createLinearGradient(0,b.y+b.h,0,b.y+b.h-ao); gB.addColorStop(0,'rgba(0,0,0,.28)'); gB.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gB; ctx.fillRect(b.x,b.y+b.h-ao,b.w,ao);
-
+    ctx.fillRect(b.x-r, b.y-r, b.w+2*r, r);      // haut
+    ctx.fillRect(b.x-r, b.y+b.h, b.w+2*r, r);    // bas
+    ctx.fillRect(b.x-r, b.y, r, b.h);            // gauche
+    ctx.fillRect(b.x+b.w, b.y, r, b.h);          // droite
     ctx.restore();
   }
 
@@ -546,14 +568,12 @@
     const b=playBounds();
     const label=`Bleu ${state.score[0]} — ${state.score[1]} Rouge`;
     ctx.save();
-    // Ombre douce
     ctx.globalAlpha=0.22;
     ctx.fillStyle='#000';
     ctx.font = `${Math.max(20*state.dpr, b.w*0.055)}px ui-sans-serif, system-ui`;
     ctx.textAlign='center'; ctx.textBaseline='top';
     const x=b.x + b.w/2, y=b.y + 16*state.dpr;
     ctx.fillText(label, x+1.5*state.dpr, y+1.5*state.dpr);
-    // Texte clair semi-translucide
     ctx.globalAlpha=0.32;
     const grad=ctx.createLinearGradient(0,y,0,y+40*state.dpr);
     grad.addColorStop(0,'rgba(255,255,255,.80)');
